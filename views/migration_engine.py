@@ -54,6 +54,7 @@ def generate_select_query(config_data, source_table, db_type='MySQL'):
     """
     Generate a SELECT query based on configuration.
     Applies TRIM at source for MSSQL CHAR columns to prevent padding.
+    For SQL Server: Also cleans non-breaking spaces and control characters at source.
     """
     try:
         if not config_data or 'mappings' not in config_data:
@@ -65,8 +66,23 @@ def generate_select_query(config_data, source_table, db_type='MySQL'):
                 continue
 
             source_col = mapping['source']
-            # Apply TRIM at source for MSSQL to handle CHAR padding
-            if db_type == 'Microsoft SQL Server' and 'TRIM' in mapping.get('transformers', []):
+            
+            # Special handling for SQL Server text columns
+            if db_type == 'Microsoft SQL Server':
+                col_expr = f'"{source_col}"'
+                
+                # Apply TRIM if specified in transformers
+                if 'TRIM' in mapping.get('transformers', []):
+                    col_expr = f'TRIM({col_expr})'
+                
+                # Clean non-breaking spaces and problematic characters for VARCHAR/NVARCHAR/TEXT columns
+                # REPLACE(col, CHAR(160), ' ') -> replace nbsp with regular space
+                # REPLACE(col, CHAR(0), '') -> remove null bytes
+                col_expr = f'REPLACE(REPLACE({col_expr}, CHAR(160), \' \'), CHAR(0), \'\')'
+                
+                selected_cols.append(f'{col_expr} AS "{source_col}"')
+            elif 'TRIM' in mapping.get('transformers', []):
+                # Other databases: just apply TRIM if needed
                 selected_cols.append(f'TRIM("{source_col}") AS "{source_col}"')
             else:
                 selected_cols.append(f'"{source_col}"')
@@ -293,18 +309,55 @@ def render_migration_engine_page():
             src_sel = st.selectbox("Source Profile", ds_options, key="src_sel")
             st.session_state.migration_src_profile = src_sel
             
-            charset_options = ["utf8mb4 (Default)", "tis620 (Thai Legacy)", "latin1 (Raw Bytes)"]
+            # Get source DB type to show appropriate charset options
+            src_db_type = None
+            if src_sel != "Select Profile...":
+                row = datasources[datasources['name'] == src_sel].iloc[0]
+                ds_detail = db.get_datasource_by_id(int(row['id']))
+                src_db_type = ds_detail['db_type']
+            
+            # Show charset options based on DB type
+            if src_db_type == 'Microsoft SQL Server':
+                charset_options = [
+                    "utf8 (Default - Modern)",
+                    "cp874 (Thai Windows Codepage - แนะนำสำหรับข้อมูลไทยเก่า)",
+                    "latin1 (Raw Bytes)"
+                ]
+                help_text = "SQL Server: ใช้ cp874 สำหรับข้อมูลไทยแบบเก่า"
+            elif src_db_type == 'MySQL':
+                charset_options = [
+                    "utf8mb4 (Default)",
+                    "tis620 (Thai Legacy)",
+                    "latin1 (Raw Bytes)"
+                ]
+                help_text = "MySQL: ใช้ tis620 ถ้าภาษาไทยเพี้ยน"
+            else:
+                charset_options = [
+                    "utf8 (Default)",
+                    "latin1 (Raw Bytes)"
+                ]
+                help_text = "เลือก charset ตามฐานข้อมูลต้นทาง"
+            
             src_charset_sel = st.selectbox(
-                "Source Charset (ถ้าภาษาไทยเพี้ยนให้ลอง tis620)", 
-                charset_options, 
-                key="src_charset_sel"
+                "Source Charset",
+                charset_options,
+                key="src_charset_sel",
+                help=help_text
             )
+            
+            # Map selection to actual charset value
             charset_map = {
                 "utf8mb4 (Default)": None,
+                "utf8 (Default - Modern)": None,
+                "utf8 (Default)": None,
                 "tis620 (Thai Legacy)": "tis620",
+                "cp874 (Thai Windows Codepage - แนะนำสำหรับข้อมูลไทยเก่า)": "cp874",
                 "latin1 (Raw Bytes)": "latin1"
             }
             st.session_state.src_charset = charset_map.get(src_charset_sel)
+            
+            if src_charset_sel.startswith("cp874"):
+                st.info("💡 **cp874** จะแก้ปัญหา non-breaking space และตัวอักษรไทยเก่าใน SQL Server")
             
             if src_sel != "Select Profile...":
                 if st.button("🔍 Test Source"):

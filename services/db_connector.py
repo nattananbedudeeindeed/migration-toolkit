@@ -54,7 +54,16 @@ def create_sqlalchemy_engine(db_type, host, port, db_name, user, password, chars
             
         elif db_type == "Microsoft SQL Server":
             # Requires: pip install pymssql
+            # For Thai data: use 'utf8' or 'cp874' (Thai Windows codepage)
+            # If source contains legacy TIS-620, try 'cp874' charset
             mssql_charset = charset if charset else "utf8"
+            
+            query_params = {"charset": mssql_charset}
+            
+            # For legacy Thai databases, add TDS version for better compatibility
+            if charset in ['tis620', 'cp874', 'latin1']:
+                query_params["tds_version"] = "7.0"  # Compatible with older SQL Server
+            
             connection_url = URL.create(
                 "mssql+pymssql",
                 username=user,
@@ -62,7 +71,7 @@ def create_sqlalchemy_engine(db_type, host, port, db_name, user, password, chars
                 host=host,
                 port=port_int or 1433,
                 database=db_name,
-                query={"charset": mssql_charset}
+                query=query_params
             )
         
         else:
