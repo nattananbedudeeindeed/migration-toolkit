@@ -267,12 +267,80 @@ def render_schema_mapper_page():
                             except: st.error("Invalid JSON file")
 
                     if config_data:
-                        loaded_config_json = config_data
-                        src_info = config_data.get('source', {})
-                        src_db_name = src_info.get('database')
-                        src_tbl_name = src_info.get('table')
+                        is_raw_data_list = False
                         
-                        if src_db_name and src_tbl_name:
+                        # Handle case where JSON is a list (e.g. wrapped in [])
+                        if isinstance(config_data, list):
+                            if len(config_data) > 0 and isinstance(config_data[0], dict):
+                                # Check if it looks like a Config List or Raw Data List
+                                first_item = config_data[0]
+                                if 'mappings' in first_item or 'source' in first_item:
+                                    # It's likely a Config List (Legacy or Batch Config)
+                                    config_data = first_item
+                                    st.info("ℹ️ Note: Loaded the first configuration object from the list.")
+                                else:
+                                    # It's likely Raw Data (List of Records)
+                                    is_raw_data_list = True
+                                    st.success(f"✅ Detected Raw JSON Data: {len(config_data)} records")
+                            else:
+                                st.error("❌ Invalid JSON Format: Expected a configuration object or list of records.")
+                                config_data = None
+
+                        if not is_raw_data_list and config_data and isinstance(config_data, dict):
+                            loaded_config_json = config_data
+                            src_info = config_data.get('source', {})
+                            src_db_name = src_info.get('database')
+                            src_tbl_name = src_info.get('table')
+                        elif is_raw_data_list:
+                            # Fake the src_info for Raw Data
+                            loaded_config_json = {"mappings": [], "source": {"table": "JSON_Upload"}, "target": {}}
+                            src_info = {}
+                            src_db_name = "JSON File"
+                            src_tbl_name = "Raw Data"
+                        
+                        # Case 1: Upload File Mode - ALWAYS use JSON Schema directly (Offline Mode)
+                        if source_mode == "Upload File":
+                            mappings = []
+                            
+                            # A. Raw Data Mode (Inferred Schema)
+                            if is_raw_data_list and isinstance(config_data, list) and len(config_data) > 0:
+                                # Infer columns from first N records (to catch optional fields)
+                                sample_records = config_data[:5]
+                                all_keys = set()
+                                for rec in sample_records:
+                                    if isinstance(rec, dict):
+                                        all_keys.update(rec.keys())
+                                
+                                sorted_keys = sorted(list(all_keys))
+                                mappings = [{"source": k, "target": "", "ignore": False} for k in sorted_keys]
+                                
+                                # Update fake loaded_config for UI consistency
+                                loaded_config_json['mappings'] = mappings
+                                loaded_config_json['source'] = {"database": "JSON File", "table": "Raw Data"}
+                                src_tbl_name = "Raw Data (JSON)"
+                                
+                            # B. Config File Mode (Existing Logic)
+                            elif isinstance(config_data, dict):
+                                mappings = config_data.get('mappings', [])
+
+                            if mappings:
+                                df_raw = pd.DataFrame({
+                                    'Table': [src_tbl_name]*len(mappings),
+                                    'Column': [m['source'] for m in mappings],
+                                    'DataType': ['JSON'] * len(mappings), 
+                                    'Sample_Values': [''] * len(mappings)
+                                })
+                                st.success(f"✅ Loaded Schema from JSON: {src_tbl_name} ({len(mappings)} columns)")
+                                selected_table = src_tbl_name
+                                source_db_input = "JSON File Source"
+                                source_table_name = src_tbl_name
+                            else:
+                                st.warning("⚠️ JSON file has no mappings to display.")
+                                with st.expander("🔍 Debug: View Loaded JSON Content", expanded=True):
+                                    st.json(config_data)
+
+                        # Case 2: Saved Config Mode - Try to connect to real DB first
+                        elif src_db_name and src_tbl_name:
                             src_ds = db.get_datasource_by_name(src_db_name)
                             schema_fetched = False
                             if src_ds:
@@ -306,8 +374,8 @@ def render_schema_mapper_page():
                                 source_db_input = src_db_name
                                 source_table_name = src_tbl_name
 
-        # --- CONFIG DETAILS SECTION (for Saved Config) ---
-        if source_mode == "Saved Config" and loaded_config_json:
+        # --- CONFIG DETAILS SECTION (for Saved Config OR Upload File) ---
+        if source_mode in ["Saved Config", "Upload File"] and loaded_config_json:
             st.markdown("---")
             st.markdown("### ⚙️ Config Details")
 
@@ -338,9 +406,9 @@ def render_schema_mapper_page():
 
                 # Target Database selectbox (from datasources)
                 tgt_db_idx = 0
-                if tgt_db in datasource_names:
+                if tgt_db and tgt_db != "" and tgt_db in datasource_names:
                     tgt_db_idx = datasource_names.index(tgt_db)
-
+                
                 selected_tgt_db = st.selectbox(
                     "Target Database",
                     datasource_names,
@@ -351,6 +419,8 @@ def render_schema_mapper_page():
 
                 # Update session state and config when database changes
                 st.session_state.mapper_tgt_db_edit = selected_tgt_db
+                if 'target' not in loaded_config_json:
+                    loaded_config_json['target'] = {}
                 loaded_config_json['target']['database'] = selected_tgt_db
 
                 # Fetch tables from selected datasource
@@ -392,6 +462,18 @@ def render_schema_mapper_page():
                     # Update session state and config when table changes
                     st.session_state.mapper_tgt_tbl_edit = selected_tgt_tbl
                     loaded_config_json['target']['table'] = selected_tgt_tbl
+                    
+                    # Fetch real target columns immediately for Dropdown & Validation
+                    if selected_tgt_tbl and selected_tgt_db and selected_tgt_db != "-- Select Datasource --":
+                        tgt_ds_cols = db.get_datasource_by_name(selected_tgt_db)
+                        if tgt_ds_cols:
+                            ok, cols = get_columns_from_table(
+                                tgt_ds_cols['db_type'], tgt_ds_cols['host'], tgt_ds_cols['port'], 
+                                tgt_ds_cols['dbname'], tgt_ds_cols['username'], tgt_ds_cols['password'], selected_tgt_tbl
+                            )
+                            if ok: 
+                                real_target_columns = [c['name'] for c in cols]
+                                st.session_state.mapper_real_tgt_cols = real_target_columns
                 else:
                     # Show disabled field if no tables available
                     st.text_input(
@@ -449,7 +531,7 @@ def render_schema_mapper_page():
         default_tgt_tbl = st.session_state.get("mapper_tgt_tbl")
 
         # --- Target Configuration ---
-        if not st.session_state.mapper_focus_mode:
+        if not st.session_state.mapper_focus_mode and source_mode not in ["Saved Config", "Upload File"]:
             st.markdown("---")
             with st.expander("📤 Target Table Configuration", expanded=True):
                 c_tgt_1, c_tgt_2 = st.columns(2)
@@ -491,7 +573,7 @@ def render_schema_mapper_page():
             target_db_input = st.session_state.get("mapper_tgt_db")
             target_table_input = st.session_state.get("mapper_tgt_tbl")
             real_target_columns = st.session_state.get("mapper_real_tgt_cols", [])
-            st.info(f"🔎 Focus Mode: `{active_table}` -> `{target_table_input}`")
+            
 
         # Initialize Data
         init_editor_state(active_df_raw, active_table, loaded_config)
