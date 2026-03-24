@@ -209,7 +209,7 @@ git clone https://github.com/yourusername/his-analyzer.git
 cd his-analyzer
 
 # 2. Create virtual environment
-python3 -m venv venv
+python3.11 -m venv venv
 
 # 3. Activate virtual environment
 source venv/bin/activate        # macOS/Linux
@@ -247,7 +247,7 @@ On first run, the application automatically creates `migration_tool.db` SQLite d
 # Start the Streamlit application
 streamlit run app.py
 # or hot reload
-streamlit run app.py --server.runOnSave true
+python3.11 -m streamlit run app.py --server.runOnSave true
 ```
 
 **The database is created automatically** with the following tables:
@@ -592,13 +592,11 @@ flowchart TD
 ### Step-by-Step Migration Process
 
 1. **Database Analysis**
-
    - Configure `config.json` with source database credentials
    - Run `./unified_db_analyzer.sh`
    - Review generated reports
 
 2. **Schema Mapping**
-
    - Launch Streamlit dashboard
    - Navigate to **Schema Mapper**
    - Load analysis report
@@ -606,7 +604,6 @@ flowchart TD
    - Select transformers (e.g., date format converters, string normalizers)
 
 3. **Configuration Export**
-
    - Generate TypeScript/JSON configuration
    - Integrate with migration pipeline
    - Test with mock data if needed
@@ -842,7 +839,6 @@ CREATE TABLE config_histories (
 **Key Features:**
 
 1. **Automatic Versioning**
-
    - No manual intervention needed
    - Every save creates a new version
    - Original version preserved forever
@@ -861,7 +857,6 @@ CREATE TABLE config_histories (
    ```
 
 3. **Rollback Support**
-
    - View all historical versions in Settings page
    - Load any previous version
    - Restore deleted configurations from history
