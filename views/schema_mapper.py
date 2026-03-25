@@ -202,7 +202,7 @@ def render_schema_mapper_page():
                                         )
                                         if ok:
                                             st.session_state[status_key] = "success"
-                                            st.rerun()
+                                            st.session_state['_mapper_needs_rerun'] = True
                                         else:
                                             st.session_state[status_key] = "fail"
                                             st.toast(f"Connection Failed: {msg}")
@@ -216,7 +216,11 @@ def render_schema_mapper_page():
                                                 src_ds['dbname'], src_ds['username'], src_ds['password']
                                             )
                                             st.session_state[status_key] = "success" if ok else "fail"
-                                            st.rerun()
+                                            st.session_state['_mapper_needs_rerun'] = True
+
+                                # Deferred rerun — outside column context
+                                if st.session_state.pop('_mapper_needs_rerun', False):
+                                    st.rerun()
 
                                 if st.session_state[status_key] == "success":
                                     success, tables = get_tables_from_datasource(
@@ -307,136 +311,121 @@ def render_schema_mapper_page():
                                 source_table_name = src_tbl_name
 
         # --- AUTO-FILL SESSION STATE FOR SAVED CONFIG ---
-        if source_mode == "Saved Config" and loaded_config_json:
-            tgt_db_name = loaded_config_json.get('target', {}).get('database', '')
-            tgt_tbl_name = loaded_config_json.get('target', {}).get('table', '')
+        # Force-reset เมื่อโหลด config ใหม่ (ตรวจจากชื่อ config)
+        if source_mode in ["Saved Config", "Upload File"] and loaded_config_json:
+            current_cfg_name = loaded_config_json.get('name', '')
+            tgt_db_from_cfg = loaded_config_json.get('target', {}).get('database', '')
+            tgt_tbl_from_cfg = loaded_config_json.get('target', {}).get('table', '')
 
-            if tgt_db_name and tgt_db_name in datasource_names:
-                st.session_state.setdefault('mapper_tgt_db_edit', tgt_db_name)
-            if tgt_tbl_name:
-                st.session_state.setdefault('mapper_tgt_tbl_edit', tgt_tbl_name)
+            # Convert dbname from config JSON → display name for selectbox
+            # Config stores dbname (e.g., "HIS"), but selectbox uses display name (e.g., "MyPostgres")
+            tgt_db_display_name = tgt_db_from_cfg  # fallback
+            if tgt_db_from_cfg and tgt_db_from_cfg not in datasource_names:
+                # Try to find datasource by dbname
+                for ds_name in datasource_names:
+                    if ds_name == "-- Select Datasource --":
+                        continue
+                    ds_info = db.get_datasource_by_name(ds_name)
+                    if ds_info and ds_info.get('dbname') == tgt_db_from_cfg:
+                        tgt_db_display_name = ds_name
+                        break
 
-            # --- RESTORE VALUE_MAP RULES FROM SAVED CONFIG ---
-            for m in loaded_config_json.get('mappings', []):
-                src_col_name = m.get('source')
-                if 'transformer_params' in m and 'VALUE_MAP' in m['transformer_params']:
-                    vmap_data = m['transformer_params']['VALUE_MAP']
-                    vmap_rules = vmap_data.get('rules', [])
+            if st.session_state.get('_mapper_loaded_config_name') != current_cfg_name:
+                # Config เปลี่ยน → force-reset ทุก target key
+                st.session_state['mapper_tgt_db'] = tgt_db_display_name
+                st.session_state['mapper_tgt_tbl'] = tgt_tbl_from_cfg
+                st.session_state.pop('mapper_tgt_tables', None)
+                st.session_state.pop('mapper_real_tgt_cols', None)
+                # ล้าง _edit keys เดิม (ถ้ามี)
+                st.session_state.pop('mapper_tgt_db_edit', None)
+                st.session_state.pop('mapper_tgt_tbl_edit', None)
+                st.session_state['_mapper_loaded_config_name'] = current_cfg_name
 
-                    # Convert rule list to DataFrame format
-                    if vmap_rules:
-                        rules_rows = []
-                        for rule in vmap_rules:
-                            conditions = rule.get('when', {})
-                            for col, val in conditions.items():
-                                rules_rows.append({
-                                    'condition_column': col,
-                                    'condition_value': str(val),
-                                    'output': str(rule.get('then', ''))
-                                })
-                        vmap_key = f"vmap_rules_{src_col_name}"
-                        st.session_state[vmap_key] = pd.DataFrame(rules_rows)
+                # Restore mapping params (VALUE_MAP, default_value)
+                for m in loaded_config_json.get('mappings', []):
+                    src_col_name = m.get('source')
+                    if 'transformer_params' in m and 'VALUE_MAP' in m['transformer_params']:
+                        vmap_data = m['transformer_params']['VALUE_MAP']
+                        vmap_rules = vmap_data.get('rules', [])
+                        if vmap_rules:
+                            rules_rows = []
+                            for rule in vmap_rules:
+                                for col, val in rule.get('when', {}).items():
+                                    rules_rows.append({
+                                        'condition_column': col,
+                                        'condition_value': str(val),
+                                        'output': str(rule.get('then', ''))
+                                    })
+                            st.session_state[f"vmap_rules_{src_col_name}"] = pd.DataFrame(rules_rows)
+                        st.session_state[f"vmap_default_{src_col_name}"] = vmap_data.get('default', '')
+                    if 'default_value' in m:
+                        st.session_state[f"default_value_{src_col_name}"] = m['default_value']
 
-                    # Restore default value
-                    vmap_default_key = f"vmap_default_{src_col_name}"
-                    st.session_state[vmap_default_key] = vmap_data.get('default', '')
-
-        # --- CONFIG DETAILS SECTION (for Saved Config) ---
-        if source_mode == "Saved Config" and loaded_config_json:
+        # --- CONFIG DETAILS SECTION (for Saved Config / Upload File) ---
+        if source_mode in ["Saved Config", "Upload File"] and loaded_config_json:
             st.markdown("---")
             st.markdown("### ⚙️ Config Details")
 
             config_detail_cols = st.columns([2, 2, 2, 2])
-
             with config_detail_cols[0]:
-                config_name_display = loaded_config_json.get('name', '')
-                st.text_input("Config Name", value=config_name_display, disabled=True, label_visibility="visible", key="saved_config_name")
-
+                st.text_input("Config Name", value=loaded_config_json.get('name', ''), disabled=True, key="saved_config_name")
             with config_detail_cols[1]:
-                src_db = loaded_config_json.get('source', {}).get('database', '')
-                st.text_input("Source Database", value=src_db, disabled=True, label_visibility="visible", key="saved_src_db")
-
+                st.text_input("Source Database", value=loaded_config_json.get('source', {}).get('database', ''), disabled=True, key="saved_src_db")
             with config_detail_cols[2]:
-                src_tbl = loaded_config_json.get('source', {}).get('table', '')
-                st.text_input("Source Table", value=src_tbl, disabled=True, label_visibility="visible", key="saved_src_tbl")
+                st.text_input("Source Table", value=loaded_config_json.get('source', {}).get('table', ''), disabled=True, key="saved_src_tbl")
 
             config_detail_cols2 = st.columns([2, 2, 2, 2])
-
             with config_detail_cols2[0]:
-                tgt_db = loaded_config_json.get('target', {}).get('database', '')
-
-                # Initialize session state for target DB
-                if 'mapper_tgt_db_edit' not in st.session_state:
-                    st.session_state.mapper_tgt_db_edit = tgt_db
-                if 'mapper_tgt_tables' not in st.session_state:
-                    st.session_state.mapper_tgt_tables = []
-
-                # Target Database selectbox (from datasources)
-                tgt_db_idx = 0
-                if tgt_db in datasource_names:
-                    tgt_db_idx = datasource_names.index(tgt_db)
-
+                # Single source of truth: mapper_tgt_db
+                cur_tgt_db = st.session_state.get('mapper_tgt_db', '')
+                tgt_db_idx = datasource_names.index(cur_tgt_db) if cur_tgt_db in datasource_names else 0
                 selected_tgt_db = st.selectbox(
-                    "Target Database",
-                    datasource_names,
-                    index=tgt_db_idx,
-                    label_visibility="visible",
-                    key="config_detail_tgt_db"
+                    "Target Database", datasource_names, index=tgt_db_idx, key="config_detail_tgt_db"
                 )
+                # เมื่อ DB เปลี่ยน → reset table list (defer rerun to outside column context)
+                if selected_tgt_db != st.session_state.get('mapper_tgt_db'):
+                    st.session_state['mapper_tgt_db'] = selected_tgt_db
+                    st.session_state.pop('mapper_tgt_tables', None)
+                    st.session_state['_mapper_needs_rerun'] = True
 
-                # Update session state and config when database changes
-                st.session_state.mapper_tgt_db_edit = selected_tgt_db
-                loaded_config_json['target']['database'] = selected_tgt_db
-
-                # Fetch tables from selected datasource
-                target_tables = []
+                # Fetch tables (cache ใน session_state)
                 if selected_tgt_db and selected_tgt_db != "-- Select Datasource --":
-                    tgt_ds = db.get_datasource_by_name(selected_tgt_db)
-                    if tgt_ds:
-                        success, tables = get_tables_from_datasource(
-                            tgt_ds['db_type'], tgt_ds['host'], tgt_ds['port'],
-                            tgt_ds['dbname'], tgt_ds['username'], tgt_ds['password']
-                        )
-                        if success:
-                            target_tables = tables
-                            st.session_state.mapper_tgt_tables = target_tables
+                    if 'mapper_tgt_tables' not in st.session_state:
+                        tgt_ds_det = db.get_datasource_by_name(selected_tgt_db)
+                        if tgt_ds_det:
+                            ok_t, tables_t = get_tables_from_datasource(
+                                tgt_ds_det['db_type'], tgt_ds_det['host'], tgt_ds_det['port'],
+                                tgt_ds_det['dbname'], tgt_ds_det['username'], tgt_ds_det['password']
+                            )
+                            if ok_t:
+                                st.session_state['mapper_tgt_tables'] = tables_t
 
             with config_detail_cols2[1]:
-                tgt_tbl = loaded_config_json.get('target', {}).get('table', '')
-
-                # Initialize session state for target table
-                if 'mapper_tgt_tbl_edit' not in st.session_state:
-                    st.session_state.mapper_tgt_tbl_edit = tgt_tbl
-
-                # Target Table selectbox (from fetched tables)
-                target_tables = st.session_state.get('mapper_tgt_tables', [])
-                tgt_tbl_idx = 0
-
-                if target_tables:
-                    if tgt_tbl in target_tables:
-                        tgt_tbl_idx = target_tables.index(tgt_tbl)
-
+                cur_tgt_tbl = st.session_state.get('mapper_tgt_tbl', '')
+                tgt_tables_list = st.session_state.get('mapper_tgt_tables', [])
+                if tgt_tables_list:
+                    tgt_tbl_idx = tgt_tables_list.index(cur_tgt_tbl) if cur_tgt_tbl in tgt_tables_list else 0
                     selected_tgt_tbl = st.selectbox(
-                        "Target Table",
-                        target_tables,
-                        index=tgt_tbl_idx,
-                        label_visibility="visible",
-                        key="config_detail_tgt_tbl"
+                        "Target Table", tgt_tables_list, index=tgt_tbl_idx, key="config_detail_tgt_tbl"
                     )
+                    st.session_state['mapper_tgt_tbl'] = selected_tgt_tbl
 
-                    # Update session state and config when table changes
-                    st.session_state.mapper_tgt_tbl_edit = selected_tgt_tbl
-                    loaded_config_json['target']['table'] = selected_tgt_tbl
+                    # Fetch real target columns (for AI auto-map + validation)
+                    tgt_ds_det2 = db.get_datasource_by_name(selected_tgt_db) if selected_tgt_db and selected_tgt_db != "-- Select Datasource --" else None
+                    if tgt_ds_det2 and selected_tgt_tbl:
+                        ok_c, cols_c = get_columns_from_table(
+                            tgt_ds_det2['db_type'], tgt_ds_det2['host'], tgt_ds_det2['port'],
+                            tgt_ds_det2['dbname'], tgt_ds_det2['username'], tgt_ds_det2['password'], selected_tgt_tbl
+                        )
+                        if ok_c:
+                            st.session_state['mapper_real_tgt_cols'] = [c['name'] for c in cols_c]
                 else:
-                    # Show disabled field if no tables available
-                    st.text_input(
-                        "Target Table",
-                        value=tgt_tbl,
-                        disabled=True,
-                        label_visibility="visible",
-                        help="Select a Target Database first",
-                        key="config_detail_tgt_tbl_disabled"
-                    )
+                    st.text_input("Target Table", value=cur_tgt_tbl, disabled=True,
+                                  help="Select a Target Database first", key="config_detail_tgt_tbl_disabled")
+
+            # Deferred rerun — outside column context to avoid KeyError
+            if st.session_state.pop('_mapper_needs_rerun', False):
+                st.rerun()
 
         # --- Context Switch Detection ---
         if selected_table:
@@ -448,11 +437,16 @@ def render_schema_mapper_page():
                 state_key = f"df_{selected_table}"
                 if state_key in st.session_state:
                     del st.session_state[state_key]
-                
+
                 if not loaded_config_json:
                     st.session_state.mapper_tgt_db = None
                     st.session_state.mapper_tgt_tbl = None
                     st.session_state.mapper_real_tgt_cols = []
+                    # ล้าง legacy _edit keys ด้วย
+                    st.session_state.pop('mapper_tgt_db_edit', None)
+                    st.session_state.pop('mapper_tgt_tbl_edit', None)
+                    st.session_state.pop('mapper_tgt_tables', None)
+                    st.session_state.pop('_mapper_loaded_config_name', None)
 
                 st.session_state.mapper_editor_ver = time.time()
                 st.session_state.last_mapper_signature = current_signature
@@ -464,8 +458,8 @@ def render_schema_mapper_page():
             
             if loaded_config_json:
                 st.session_state.mapper_loaded_config = loaded_config_json
-                st.session_state.mapper_tgt_db = loaded_config_json.get('target', {}).get('database')
-                st.session_state.mapper_tgt_tbl = loaded_config_json.get('target', {}).get('table')
+                # Do NOT overwrite tgt_db/tgt_tbl — user may have changed them via Config Details
+                # Auto-fill block (guarded by _mapper_loaded_config_name) handles initial load
             else:
                  st.session_state.mapper_loaded_config = None
 
@@ -484,49 +478,59 @@ def render_schema_mapper_page():
         default_tgt_tbl = st.session_state.get("mapper_tgt_tbl")
 
         # --- Target Configuration ---
-        if not st.session_state.mapper_focus_mode:
-            st.markdown("---")
-            with st.expander("📤 Target Table Configuration", expanded=True):
-                c_tgt_1, c_tgt_2 = st.columns(2)
-                
-                tgt_idx = 0
-                if default_tgt_db in datasource_names:
-                    tgt_idx = datasource_names.index(default_tgt_db)
-                
-                target_db_input = c_tgt_1.selectbox("Target Datasource", datasource_names, index=tgt_idx, key="tgt_ds")
-                
-                target_tables = []
-                if target_db_input and target_db_input != "-- Select Datasource --":
-                    tgt_ds = db.get_datasource_by_name(target_db_input)
-                    if tgt_ds:
-                        ok, res = get_tables_from_datasource(
-                            tgt_ds['db_type'], tgt_ds['host'], tgt_ds['port'], 
-                            tgt_ds['dbname'], tgt_ds['username'], tgt_ds['password']
-                        )
-                        if ok:
-                            target_tables = res
-                            def_tbl_idx = target_tables.index(default_tgt_tbl) if (default_tgt_tbl and default_tgt_tbl in target_tables) else (target_tables.index(active_table) if active_table in target_tables else 0)
-                            target_table_input = c_tgt_2.selectbox("Target Table", target_tables, index=def_tbl_idx, key="tgt_tbl_cfg_sel")
-                        else:
-                            target_table_input = c_tgt_2.text_input("Target Table", value=default_tgt_tbl if default_tgt_tbl else active_table, key="tgt_tbl_cfg_txt")
+        _saved_config_mode = st.session_state.source_mode in ["Saved Config", "Upload File"] and loaded_config is not None
 
-                    if target_table_input:
-                        ok, cols = get_columns_from_table(
-                            tgt_ds['db_type'], tgt_ds['host'], tgt_ds['port'], 
-                            tgt_ds['dbname'], tgt_ds['username'], tgt_ds['password'], target_table_input
-                        )
-                        if ok: real_target_columns = [c['name'] for c in cols]
-                else:
-                    target_table_input = c_tgt_2.text_input("Target Table", value="", placeholder="Please select datasource first", disabled=True, key="tgt_tbl_cfg_disabled")
-            
-            st.session_state.mapper_tgt_db = target_db_input
-            st.session_state.mapper_tgt_tbl = target_table_input
-            st.session_state.mapper_real_tgt_cols = real_target_columns
+        if not st.session_state.mapper_focus_mode:
+            if not _saved_config_mode:
+                # Non-saved-config: แสดง expander ให้เลือก target
+                st.markdown("---")
+                with st.expander("📤 Target Table Configuration", expanded=True):
+                    c_tgt_1, c_tgt_2 = st.columns(2)
+
+                    tgt_idx = 0
+                    if default_tgt_db in datasource_names:
+                        tgt_idx = datasource_names.index(default_tgt_db)
+
+                    target_db_input = c_tgt_1.selectbox("Target Datasource", datasource_names, index=tgt_idx, key="tgt_ds")
+
+                    target_tables = []
+                    if target_db_input and target_db_input != "-- Select Datasource --":
+                        tgt_ds = db.get_datasource_by_name(target_db_input)
+                        if tgt_ds:
+                            ok, res = get_tables_from_datasource(
+                                tgt_ds['db_type'], tgt_ds['host'], tgt_ds['port'],
+                                tgt_ds['dbname'], tgt_ds['username'], tgt_ds['password']
+                            )
+                            if ok:
+                                target_tables = res
+                                def_tbl_idx = target_tables.index(default_tgt_tbl) if (default_tgt_tbl and default_tgt_tbl in target_tables) else (target_tables.index(active_table) if active_table in target_tables else 0)
+                                target_table_input = c_tgt_2.selectbox("Target Table", target_tables, index=def_tbl_idx, key="tgt_tbl_cfg_sel")
+                            else:
+                                target_table_input = c_tgt_2.text_input("Target Table", value=default_tgt_tbl if default_tgt_tbl else active_table, key="tgt_tbl_cfg_txt")
+
+                        if target_table_input:
+                            ok, cols = get_columns_from_table(
+                                tgt_ds['db_type'], tgt_ds['host'], tgt_ds['port'],
+                                tgt_ds['dbname'], tgt_ds['username'], tgt_ds['password'], target_table_input
+                            )
+                            if ok:
+                                real_target_columns = [c['name'] for c in cols]
+                    else:
+                        target_table_input = c_tgt_2.text_input("Target Table", value="", placeholder="Please select datasource first", disabled=True, key="tgt_tbl_cfg_disabled")
+
+                st.session_state.mapper_tgt_db = target_db_input
+                st.session_state.mapper_tgt_tbl = target_table_input
+                st.session_state.mapper_real_tgt_cols = real_target_columns
+            else:
+                # Saved Config mode: อ่านจาก session_state ที่ถูก auto-fill แล้ว
+                target_db_input = st.session_state.get("mapper_tgt_db", "")
+                target_table_input = st.session_state.get("mapper_tgt_tbl", "")
+                real_target_columns = st.session_state.get("mapper_real_tgt_cols", [])
         else:
             target_db_input = st.session_state.get("mapper_tgt_db")
             target_table_input = st.session_state.get("mapper_tgt_tbl")
             real_target_columns = st.session_state.get("mapper_real_tgt_cols", [])
-            st.info(f"🔎 Focus Mode: `{active_table}` -> `{target_table_input}`")
+            st.info(f"🔎 Focus Mode: `{active_table}` → `{target_table_input}`")
 
         # Initialize Data
         init_editor_state(active_df_raw, active_table, loaded_config)
@@ -571,51 +575,56 @@ def render_schema_mapper_page():
                 src_tbl_name = loaded_config.get('source', {}).get('table', '') if loaded_config else source_table_name
                 st.text_input("Source Table", value=src_tbl_name, disabled=True, label_visibility="visible", key="metadata_src_tbl")
 
-            # Row 3: Target Database & Table (Editable)
+            # Row 3: Target Database & Table
             tgt_cols = st.columns([2, 2])
             with tgt_cols[0]:
-                tgt_db_name = st.session_state.get("mapper_tgt_db_edit", target_db_input if target_db_input else "")
-                selected_tgt_db_name = st.selectbox(
-                    "Target Database",
-                    datasource_names,
-                    index=datasource_names.index(tgt_db_name) if tgt_db_name in datasource_names else 0,
-                    label_visibility="visible",
-                    key="config_tgt_db_meta"
-                )
-                st.session_state.mapper_tgt_db_edit = selected_tgt_db_name
+                if _saved_config_mode:
+                    # Saved Config: readonly — แก้ไขได้ใน Config Details ด้านบนแล้ว
+                    st.text_input("Target Database", value=st.session_state.get('mapper_tgt_db', ''),
+                                  disabled=True, key="metadata_tgt_db_ro",
+                                  help="แก้ไขได้ใน Config Details ด้านบน")
+                    selected_tgt_db_name = st.session_state.get('mapper_tgt_db', '')
+                else:
+                    # Non-saved-config: editable selectbox
+                    cur_tgt_db_meta = st.session_state.get("mapper_tgt_db", target_db_input or "")
+                    selected_tgt_db_name = st.selectbox(
+                        "Target Database", datasource_names,
+                        index=datasource_names.index(cur_tgt_db_meta) if cur_tgt_db_meta in datasource_names else 0,
+                        key="config_tgt_db_meta"
+                    )
+                    st.session_state['mapper_tgt_db'] = selected_tgt_db_name
 
             with tgt_cols[1]:
-                tgt_tbl_name = st.session_state.get("mapper_tgt_tbl_edit", target_table_input if target_table_input else "")
-                tgt_tables_meta = []
-                if selected_tgt_db_name and selected_tgt_db_name != "-- Select Datasource --":
-                    tgt_ds_meta = db.get_datasource_by_name(selected_tgt_db_name)
-                    if tgt_ds_meta:
-                        success, tables_meta = get_tables_from_datasource(
-                            tgt_ds_meta['db_type'], tgt_ds_meta['host'], tgt_ds_meta['port'],
-                            tgt_ds_meta['dbname'], tgt_ds_meta['username'], tgt_ds_meta['password']
-                        )
-                        if success:
-                            tgt_tables_meta = tables_meta
-
-                if tgt_tables_meta:
-                    selected_tgt_tbl_meta = st.selectbox(
-                        "Target Table",
-                        tgt_tables_meta,
-                        index=tgt_tables_meta.index(tgt_tbl_name) if tgt_tbl_name in tgt_tables_meta else 0,
-                        label_visibility="visible",
-                        key="config_tgt_tbl_meta"
-                    )
-                    st.session_state.mapper_tgt_tbl_edit = selected_tgt_tbl_meta
-                    target_table_input = selected_tgt_tbl_meta
+                if _saved_config_mode:
+                    # Saved Config: readonly
+                    st.text_input("Target Table", value=st.session_state.get('mapper_tgt_tbl', ''),
+                                  disabled=True, key="metadata_tgt_tbl_ro",
+                                  help="แก้ไขได้ใน Config Details ด้านบน")
+                    target_table_input = st.session_state.get('mapper_tgt_tbl', '')
                 else:
-                    st.text_input(
-                        "Target Table",
-                        value=tgt_tbl_name,
-                        disabled=True,
-                        label_visibility="visible",
-                        help="Select a Target Database first",
-                        key="metadata_tgt_tbl_disabled"
-                    )
+                    # Non-saved-config: editable selectbox
+                    cur_tgt_tbl_meta = st.session_state.get("mapper_tgt_tbl", target_table_input or "")
+                    tgt_tables_meta = []
+                    if selected_tgt_db_name and selected_tgt_db_name != "-- Select Datasource --":
+                        tgt_ds_meta = db.get_datasource_by_name(selected_tgt_db_name)
+                        if tgt_ds_meta:
+                            success, tables_meta = get_tables_from_datasource(
+                                tgt_ds_meta['db_type'], tgt_ds_meta['host'], tgt_ds_meta['port'],
+                                tgt_ds_meta['dbname'], tgt_ds_meta['username'], tgt_ds_meta['password']
+                            )
+                            if success:
+                                tgt_tables_meta = tables_meta
+                    if tgt_tables_meta:
+                        selected_tgt_tbl_meta = st.selectbox(
+                            "Target Table", tgt_tables_meta,
+                            index=tgt_tables_meta.index(cur_tgt_tbl_meta) if cur_tgt_tbl_meta in tgt_tables_meta else 0,
+                            key="config_tgt_tbl_meta"
+                        )
+                        st.session_state['mapper_tgt_tbl'] = selected_tgt_tbl_meta
+                        target_table_input = selected_tgt_tbl_meta
+                    else:
+                        st.text_input("Target Table", value=cur_tgt_tbl_meta, disabled=True,
+                                      help="Select a Target Database first", key="metadata_tgt_tbl_disabled")
 
             # Row 4: Batch Size
             batch_cols = st.columns([4])
@@ -647,8 +656,7 @@ def render_schema_mapper_page():
                         df_current['Required'] = False
                         st.session_state[f"df_{active_table}"] = df_current
                         st.session_state.mapper_editor_ver = time.time()
-                        st.success("✓ All columns marked as ignored")
-                        st.rerun()
+                        st.session_state['_mapper_needs_rerun'] = True
 
                 with col_uncheck_all:
                     if st.button("✗ Uncheck All", use_container_width=True, help="Unmark all columns as ignored"):
@@ -656,8 +664,7 @@ def render_schema_mapper_page():
                         df_current['Ignore'] = False
                         st.session_state[f"df_{active_table}"] = df_current
                         st.session_state.mapper_editor_ver = time.time()
-                        st.success("✗ All columns unmarked as ignored")
-                        st.rerun()
+                        st.session_state['_mapper_needs_rerun'] = True
 
             with c_ai:
                 # --- AI AUTO-MAP BUTTON ---
@@ -679,9 +686,13 @@ def render_schema_mapper_page():
 
                             st.session_state[f"df_{active_table}"] = df_current
                             st.session_state.mapper_editor_ver = time.time()
-                            st.success(f"🤖 AI matched {match_count} columns!")
-                            st.rerun()
-        
+                            st.toast(f"AI matched {match_count} columns!", icon="🤖")
+                            st.session_state['_mapper_needs_rerun'] = True
+
+        # Deferred rerun — outside column context to avoid KeyError
+        if st.session_state.pop('_mapper_needs_rerun', False):
+            st.rerun()
+
         # Prepare DataFrame
         df_to_edit = st.session_state[f"df_{active_table}"].copy()
         
@@ -691,7 +702,7 @@ def render_schema_mapper_page():
         gb.configure_column("Type", editable=False, width=120)
         
         if real_target_columns:
-            gb.configure_column("Target Column", editable=True, width=250, cellEditor='agRichSelectCellEditor', cellEditorParams={'values': real_target_columns, 'searchDebounceDelay': 200, 'allowTyping': True, 'filterList': True})
+            gb.configure_column("Target Column", editable=True, width=250, cellEditor='agSelectCellEditor', cellEditorParams={'values': real_target_columns})
         else:
             gb.configure_column("Target Column", editable=True, width=250)
 
@@ -760,6 +771,40 @@ def render_schema_mapper_page():
 
                     # Get ignore status from the row
                     is_ignored = sel_row.get('Ignore', False)
+
+                    # --- DEFAULT VALUE (อ่านจาก DataFrame row) ---
+                    dv_key = f"default_value_{src_col}"
+                    existing_dv = str(sel_row.get('Default Value', '') or '')
+                    # Set initial session_state only if not yet set (ป้องกัน overwrite ที่ user พิมพ์ไว้)
+                    if dv_key not in st.session_state:
+                        st.session_state[dv_key] = existing_dv
+                    new_default_value = st.text_input(
+                        "Default Value (ใส่ค่าสำรองเมื่อ transform แล้วได้ null เช่น `1900-01-01`)",
+                        key=dv_key,
+                        placeholder="ว่าง = ไม่ใช้ default, ใส่ได้ เช่น 1900-01-01 / 0 / N/A"
+                    )
+
+                    # --- GENERATE_HN OPTIONS EDITOR ---
+                    if "GENERATE_HN" in new_trans:
+                        st.markdown("**GENERATE_HN Options** — ตั้งค่า HN Counter")
+                        ghn_key = f"ghn_auto_detect_{src_col}"
+                        ghn_start_key = f"ghn_start_from_{src_col}"
+
+                        auto_detect = st.checkbox(
+                            "Auto-detect Max HN from Target DB (แนะนำ)",
+                            value=st.session_state.get(ghn_key, True),
+                            key=ghn_key,
+                            help="ก่อน migrate จะ query MAX(hn_column) จาก target table แล้วต่อ counter จากนั้น"
+                        )
+                        if not auto_detect:
+                            st.number_input(
+                                "Start From (ตั้งค่า HN counter เริ่มต้น)",
+                                min_value=0,
+                                value=int(st.session_state.get(ghn_start_key, 0)),
+                                step=1,
+                                key=ghn_start_key,
+                                help="ค่าเริ่มต้น HN counter ถ้า 0 = เริ่มจาก HN000000001"
+                            )
 
                     # --- VALUE_MAP RULES EDITOR ---
                     if "VALUE_MAP" in new_trans:
@@ -831,6 +876,8 @@ def render_schema_mapper_page():
                         st.session_state[f"df_{active_table}"].at[idx, 'Target Column'] = new_target
                         st.session_state[f"df_{active_table}"].at[idx, 'Transformers'] = ", ".join(new_trans)
                         st.session_state[f"df_{active_table}"].at[idx, 'Validators'] = ", ".join(new_vals)
+                        # บันทึก Default Value ลง DataFrame จริงๆ
+                        st.session_state[f"df_{active_table}"].at[idx, 'Default Value'] = st.session_state.get(dv_key, '')
 
                         # Auto-uncheck Required if column is ignored
                         if is_ignored:
@@ -870,7 +917,7 @@ def render_schema_mapper_page():
                                     updated_df = validate_mapping_in_table(st.session_state[f"df_{active_table}"], real_target_columns)
                                     st.session_state[f"df_{active_table}"] = updated_df
                                     st.session_state.mapper_editor_ver = time.time()
-                                    st.rerun()
+                                    st.session_state['_mapper_needs_rerun'] = True
                                 else:
                                     st.error(f"❌ Cannot fetch columns: {cols}")
                     else:
@@ -893,8 +940,8 @@ def render_schema_mapper_page():
 
                 # Get actual dbnames from display names
                 src_db_actual = get_dbname_preview(st.session_state.get("mapper_source_db"))
-                tgt_db_actual = get_dbname_preview(st.session_state.get("mapper_tgt_db_edit", target_db_input or ""))
-                tgt_tbl_actual = st.session_state.get("mapper_tgt_tbl_edit", target_table_input or "")
+                tgt_db_actual = get_dbname_preview(st.session_state.get("mapper_tgt_db", target_db_input or ""))
+                tgt_tbl_actual = st.session_state.get("mapper_tgt_tbl", target_table_input or "")
 
                 params = {
                     "config_name": config_name_to_use,
@@ -925,12 +972,10 @@ def render_schema_mapper_page():
                 src_db_display = st.session_state.get("mapper_source_db")
                 src_db_actual = get_dbname(src_db_display)
 
-                # Target database - use the metadata input fields
-                tgt_db_display = st.session_state.get("mapper_tgt_db_edit", target_db_input or "")
+                # Single source of truth: mapper_tgt_db / mapper_tgt_tbl
+                tgt_db_display = st.session_state.get("mapper_tgt_db", target_db_input or "")
                 tgt_db_actual = get_dbname(tgt_db_display)
-
-                # Target table - use the metadata input fields
-                tgt_tbl_actual = st.session_state.get("mapper_tgt_tbl_edit", target_table_input or "")
+                tgt_tbl_actual = st.session_state.get("mapper_tgt_tbl", target_table_input or "")
 
                 params = {
                     "config_name": save_name,
@@ -944,21 +989,24 @@ def render_schema_mapper_page():
                 json_data = generate_json_config(params, current_df)
                 success, msg = db.save_config_to_db(params['config_name'], active_table, json_data)
                 if success:
-                    st.success(msg)
+                    st.toast(f"Config '{save_name}' saved successfully!", icon="✅")
                     st.session_state.mapper_editor_ver = time.time()
+                    st.session_state['_mapper_needs_rerun'] = True
                 else:
-                    st.error(msg)
+                    st.toast(f"Save failed: {msg}", icon="❌")
 
             st.write("")
             if is_edit_existing:
                 if st.button(f"💾 Save (Overwrite)", type="primary", use_container_width=True, help=f"Update '{default_config_name}'"):
                     do_save(default_config_name)
-                    st.rerun()
             else:
                 config_name_to_save = st.session_state.get("mapper_config_name", default_config_name)
                 if st.button("💾 Save Configuration", type="primary", use_container_width=True):
                     do_save(config_name_to_save)
-                    st.rerun()
+
+        # Deferred rerun — outside column context to avoid KeyError
+        if st.session_state.pop('_mapper_needs_rerun', False):
+            st.rerun()
 
         # ==================== CONFIG HISTORY VIEWER ====================
         if st.session_state.get("mapper_show_history", False):
@@ -1025,10 +1073,12 @@ def init_editor_state(df, table_name, config_json=None):
             validators = []
             ignore = False
 
+            default_value = ""
             if src_col in mapping_dict:
                 rule = mapping_dict[src_col]
                 target_col = rule.get('target', target_col)
                 ignore = rule.get('ignore', False)
+                default_value = rule.get('default_value', '')
                 if 'transformers' in rule:
                     transformers = rule['transformers']
                 if 'validators' in rule:
@@ -1045,6 +1095,7 @@ def init_editor_state(df, table_name, config_json=None):
                 "Target Column": target_col,
                 "Transformers": ", ".join(transformers),
                 "Validators": ", ".join(validators),
+                "Default Value": default_value,
                 "Required": False,
                 "Ignore": ignore
             })
@@ -1124,8 +1175,29 @@ def generate_json_config(params, mappings_df):
                 transformers_list = [t.strip() for t in tf_val.split(',') if t.strip()]
                 mapping_item["transformers"] = transformers_list
 
-        # Handle VALUE_MAP transformer_params
+        # Handle default_value — อ่านจาก DataFrame row (reliable) ก่อน session_state fallback
         src_col = row['Source Column']
+        default_val = str(row.get('Default Value', '') or '').strip()
+        if not default_val:
+            # fallback: ถ้า DataFrame ไม่มี (เช่น row เก่าก่อน upgrade) ให้อ่าน session_state
+            default_val = st.session_state.get(f"default_value_{src_col}", '').strip()
+        if default_val:
+            mapping_item['default_value'] = default_val
+
+        # Handle GENERATE_HN transformer_params
+        if "GENERATE_HN" in transformers_list:
+            ghn_auto_key = f"ghn_auto_detect_{src_col}"
+            ghn_start_key = f"ghn_start_from_{src_col}"
+            auto_detect = st.session_state.get(ghn_auto_key, True)
+            start_from = int(st.session_state.get(ghn_start_key, 0))
+
+            mapping_item['transformer_params'] = mapping_item.get('transformer_params', {})
+            mapping_item['transformer_params']['GENERATE_HN'] = {
+                'auto_detect_max': auto_detect,
+                'start_from': start_from
+            }
+
+        # Handle VALUE_MAP transformer_params
         if "VALUE_MAP" in transformers_list:
             vmap_rules_key = f"vmap_rules_{src_col}"
             vmap_default_key = f"vmap_default_{src_col}"

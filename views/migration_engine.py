@@ -366,6 +366,29 @@ def render_migration_engine_page():
         with st.expander("📄 View Configuration JSON", expanded=False):
             st.json(config)
 
+        # --- VALIDATION: ห้าม source == target ---
+        src_db_cfg = config.get('source', {}).get('database', '')
+        tgt_db_cfg = config.get('target', {}).get('database', '')
+        src_tbl_cfg = config.get('source', {}).get('table', '')
+        tgt_tbl_cfg = config.get('target', {}).get('table', '')
+
+        _src_profile = st.session_state.get('migration_src_profile', '')
+        _tgt_profile = st.session_state.get('migration_tgt_profile', '')
+        _src_ds_row = db.get_datasource_by_name(_src_profile) if _src_profile else None
+        _tgt_ds_row = db.get_datasource_by_name(_tgt_profile) if _tgt_profile else None
+
+        _same_conn = (_src_ds_row and _tgt_ds_row and
+                      _src_ds_row['host'] == _tgt_ds_row['host'] and
+                      _src_ds_row['port'] == _tgt_ds_row['port'] and
+                      _src_ds_row['dbname'] == _tgt_ds_row['dbname'])
+        _same_table = src_tbl_cfg == tgt_tbl_cfg
+        _is_self_migration = _same_conn and _same_table
+
+        if _is_self_migration:
+            st.error(f"🚨 **Source และ Target เป็นตารางเดียวกัน!**  \n"
+                     f"`{src_tbl_cfg}` → `{tgt_tbl_cfg}` บน DB เดียวกัน  \n"
+                     f"Migration จะ insert กลับเข้าหาตัวเอง — กรุณาแก้ไข config ก่อน")
+
         col_set1, col_set2 = st.columns(2)
         with col_set1:
             st.markdown("#### Mapping Summary")
@@ -424,7 +447,7 @@ def render_migration_engine_page():
                 st.rerun()
         with col_btn2:
             btn_label = "🔄 Resume Migration" if (checkpoint and st.session_state.resume_from_checkpoint) else "🚀 Start Migration Engine"
-            if st.button(btn_label, type="primary", use_container_width=True):
+            if st.button(btn_label, type="primary", use_container_width=True, disabled=_is_self_migration):
                 st.session_state.migration_running = False
                 st.session_state.migration_completed = False
                 if checkpoint and st.session_state.resume_from_checkpoint:
@@ -531,6 +554,24 @@ def render_migration_engine_page():
 
                 target_table = config['target']['table']
 
+                # --- PRE-MIGRATION COUNT (for verification & rollback) ---
+                migration_start_time = datetime.now()
+                pre_migration_count = 0
+                try:
+                    with tgt_engine.connect() as conn:
+                        result = conn.execute(text(f"SELECT COUNT(*) FROM {target_table}"))
+                        pre_migration_count = result.scalar() or 0
+                    add_log(f"Pre-migration count: {pre_migration_count:,} rows in `{target_table}`", "📊")
+                    # Store for rollback
+                    st.session_state['last_migration_info'] = {
+                        'table': target_table,
+                        'tgt_profile': tgt_profile_name,
+                        'start_time': migration_start_time.isoformat(),
+                        'pre_count': pre_migration_count
+                    }
+                except Exception as e:
+                    add_log(f"Could not get pre-migration count (non-critical): {e}", "⚠️")
+
                 # --- NEW: TRUNCATE EXECUTION ---
                 if st.session_state.get('truncate_target', False):
                     add_log(f"Cleaning target table: {target_table}...", "🧹")
@@ -601,6 +642,38 @@ def render_migration_engine_page():
 
                 except Exception as e:
                      add_log(f"Skipping schema check (Non-critical): {e}", "⚠️")
+
+                # --- GENERATE_HN: Auto-detect max HN counter from target DB ---
+                for mapping in config.get('mappings', []):
+                    if mapping.get('ignore', False): continue
+                    if 'GENERATE_HN' not in mapping.get('transformers', []): continue
+
+                    ghn_params = mapping.get('transformer_params', {}).get('GENERATE_HN', {})
+                    auto_detect = ghn_params.get('auto_detect_max', True)
+                    start_from = int(ghn_params.get('start_from', 0))
+
+                    if auto_detect:
+                        target_hn_col = mapping.get('target', mapping.get('source'))
+                        add_log(f"Auto-detecting max HN from `{target_table}.{target_hn_col}`...", "🔍")
+                        try:
+                            with tgt_engine.connect() as conn:
+                                result = conn.execute(text(f'SELECT MAX("{target_hn_col}") FROM {target_table}'))
+                                max_val = result.scalar()
+
+                            if max_val:
+                                # Parse numeric part from HN format e.g. "HN000000123" → 123
+                                import re as _re
+                                digits = _re.sub(r'\D', '', str(max_val))
+                                start_from = int(digits) if digits else 0
+                                add_log(f"Max HN found: `{max_val}` → counter starts at {start_from}", "✅")
+                            else:
+                                add_log(f"No existing HN in target (empty table) → counter starts at {start_from}", "ℹ️")
+                        except Exception as e:
+                            add_log(f"Auto-detect HN failed: {e} → using start_from={start_from}", "⚠️")
+
+                    DataTransformer.reset_hn_counter(start_from)
+                    add_log(f"HN Counter initialized at {start_from} (next HN: HN{str(start_from+1).zfill(9)})", "🔢")
+                    break  # Only one GENERATE_HN per config
 
                 # Prepare Query
                 batch_size = st.session_state.batch_size
@@ -703,7 +776,28 @@ def render_migration_engine_page():
                 if not migration_failed:
                     progress_bar.progress(100)
                     status_box.update(label="Migration Complete!", state="complete", expanded=False)
-                    st.success(f"✅ Migration Finished Successfully! Total Rows: {total_rows_processed}")
+
+                    # --- POST-MIGRATION VERIFICATION ---
+                    try:
+                        with tgt_engine.connect() as conn:
+                            result = conn.execute(text(f"SELECT COUNT(*) FROM {target_table}"))
+                            post_count = result.scalar() or 0
+                        actual_inserted = post_count - pre_migration_count
+                        add_log(f"Post-migration count: {post_count:,} rows (inserted: {actual_inserted:,})", "📊")
+
+                        if actual_inserted == total_rows_processed:
+                            st.success(f"✅ Migration Verified! Inserted **{actual_inserted:,}** rows into `{target_table}` (total: {post_count:,})")
+                        else:
+                            st.warning(f"⚠️ Count Mismatch! Processed: {total_rows_processed:,} | Actually in DB: {actual_inserted:,}  \n"
+                                       f"Target now has {post_count:,} rows total.")
+                        # Update rollback info with actual inserted count
+                        if 'last_migration_info' in st.session_state:
+                            st.session_state['last_migration_info']['inserted'] = actual_inserted
+                            st.session_state['last_migration_info']['post_count'] = post_count
+                    except Exception as e:
+                        st.success(f"✅ Migration Finished! Total Rows Processed: {total_rows_processed:,}")
+                        add_log(f"Could not verify post-count: {e}", "⚠️")
+
                     # Clear checkpoint on success
                     clear_checkpoint(config_name)
                     add_log("Checkpoint cleared (migration complete)", "🧹")
@@ -719,7 +813,7 @@ def render_migration_engine_page():
                 add_log(f"CRITICAL ERROR: {str(e)}", "💀")
 
         st.divider()
-        col_end1, col_end2 = st.columns(2)
+        col_end1, col_end2, col_end3 = st.columns(3)
         with col_end1:
             if st.button("🔄 Start New Migration", use_container_width=True):
                 st.session_state.migration_running = False
@@ -728,7 +822,50 @@ def render_migration_engine_page():
                 st.session_state.checkpoint_batch = 0
                 st.session_state.migration_step = 1
                 st.rerun()
+
         with col_end2:
+            # --- ROLLBACK BUTTON ---
+            migration_info = st.session_state.get('last_migration_info')
+            if migration_info:
+                inserted = migration_info.get('inserted', 0)
+                rb_label = f"🔙 Rollback ({inserted:,} rows)" if inserted else "🔙 Rollback Last Migration"
+                if st.button(rb_label, type="secondary", use_container_width=True, help="ลบ rows ที่ insert ใน migration นี้"):
+                    try:
+                        rb_tgt_ds = db.get_datasource_by_name(migration_info['tgt_profile'])
+                        rb_engine = connector.create_sqlalchemy_engine(
+                            rb_tgt_ds['db_type'], rb_tgt_ds['host'], rb_tgt_ds['port'],
+                            rb_tgt_ds['dbname'], rb_tgt_ds['username'], rb_tgt_ds['password']
+                        )
+                        rb_table = migration_info['table']
+                        rb_start = migration_info['start_time']
+                        rb_pre_count = migration_info['pre_count']
+
+                        deleted = 0
+                        with rb_engine.begin() as conn:
+                            # Strategy 1: ลบโดย created_at >= migration_start_time
+                            try:
+                                result = conn.execute(text(
+                                    f"DELETE FROM {rb_table} WHERE created_at >= :ts RETURNING *"
+                                ), {"ts": rb_start})
+                                deleted = result.rowcount
+                                st.success(f"✅ Rollback สำเร็จ — ลบ {deleted:,} rows (created_at >= {rb_start[:19]})")
+                            except Exception:
+                                # Strategy 2: ลบโดย row count (ctid สูงสุด)
+                                result = conn.execute(text(
+                                    f"DELETE FROM {rb_table} WHERE ctid IN "
+                                    f"(SELECT ctid FROM {rb_table} ORDER BY ctid DESC LIMIT :n)"
+                                ), {"n": inserted})
+                                deleted = result.rowcount
+                                st.success(f"✅ Rollback สำเร็จ — ลบ {deleted:,} rows")
+
+                        st.session_state.pop('last_migration_info', None)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Rollback failed: {e}")
+            else:
+                st.button("🔙 Rollback", disabled=True, use_container_width=True, help="ไม่มีข้อมูล migration ล่าสุด")
+
+        with col_end3:
             if st.session_state.get('migration_log_file') and os.path.exists(st.session_state.migration_log_file):
                 log_content = None
                 for encoding in ['utf-8', 'cp874', 'tis-620', 'latin-1']:

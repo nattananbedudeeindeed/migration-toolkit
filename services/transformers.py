@@ -29,6 +29,7 @@ class DataTransformer:
             target_col = mapping.get('target', source_col)
             transformers = mapping.get('transformers', [])
             transformer_params = mapping.get('transformer_params', {})
+            default_value = mapping.get('default_value', None)
 
             # Special handling for GENERATE_HN: Create column even if source doesn't exist
             if 'GENERATE_HN' in transformers:
@@ -76,6 +77,14 @@ class DataTransformer:
                     df[target_col] = series_data
                 else:
                     df[source_col] = series_data
+
+            # Apply default_value to fill nulls in the result column
+            if default_value is not None:
+                col_to_fill = target_col if target_col in df.columns else source_col
+                if col_to_fill in df.columns:
+                    df[col_to_fill] = df[col_to_fill].fillna(default_value)
+                    # Also replace empty strings with default_value
+                    df[col_to_fill] = df[col_to_fill].replace('', default_value)
 
         return df
 
