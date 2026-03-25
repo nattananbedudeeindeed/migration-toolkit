@@ -216,6 +216,8 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
 );
 ```
 
+**Schema Migration Strategy**: ใช้ `CREATE TABLE IF NOT EXISTS` สำหรับตารางใหม่ทั้ง 2 ตาราง — ปลอดภัยสำหรับ production ที่รันอยู่แล้ว ถ้าในอนาคตต้องเพิ่ม column ใน table ที่มีอยู่ ให้ใช้ `PRAGMA table_info()` เช็คก่อนแล้ว `ALTER TABLE ADD COLUMN` ตาม pattern ของ `ensure_config_histories_table()` ใน `database.py`
+
 CRUD functions (follow existing patterns: `save_datasource`, `get_datasources`, etc.):
 - `save_pipeline(name, description, json_data, source_ds_id, target_ds_id, error_strategy) -> (bool, str)`
 - `get_pipelines_list() -> pd.DataFrame`
@@ -335,10 +337,18 @@ class PipelineExecutor:
         # Return sorted list
 
     def _should_skip(self, step, results) -> tuple[bool, str]:
-        """Check depends_on against failed steps."""
+        """Check depends_on against failed steps (transitive).
+
+        ใช้ BFS/DFS traversal เพื่อ mark downstream nodes ทั้งหมด:
+        ถ้า Step A พัง → Step B (depends A) ถูก skip →
+        Step C (depends B) ต้องถูก skip ด้วย แม้ไม่ได้ depend A โดยตรง
+        """
         # fail_fast: never reaches here (loop breaks)
         # continue_on_error: don't skip
-        # skip_dependents: skip if any dependency in failed/skipped set
+        # skip_dependents: maintain failed_steps: set + skipped_steps: set
+        #   ระหว่าง loop — ถ้า step.depends_on ตัวใดอยู่ใน 2 sets นี้
+        #   → skip ทันที + เพิ่มตัวเองลง skipped_steps
+        #   ไม่ต้องทำ DFS ใหม่ทุกรอบ เพราะ results dict สะสม status มาแล้ว
 
     def _update_step_checkpoint(self, config_name, batch_num, rows):
         """Update 2D checkpoint per batch."""
@@ -412,6 +422,8 @@ def run() -> None:
 Key callbacks:
 - `_on_start_pipeline()`: resolve credentials → `PipelineExecutor(conn_configs)` → `start_background()` → store run_id
 - `_on_poll_status()`: `get_latest_pipeline_run(run_id)` → parse steps_json → update form_state
+- `_on_force_cancel_run(run_id)`: mark zombie run as failed → `update_pipeline_run(run_id, "failed", error_message="Manually cancelled")`
+- `_check_zombie_runs()`: เรียกตอน `run()` init → เช็ค runs ที่ `status='running'` นานกว่า 24 ชม. → set warning flag ใน form_state
 
 ### 5B. View — 4-step wizard
 
@@ -422,7 +434,7 @@ Key callbacks:
 | 1. Design | ออกแบบ pipeline | เลือก configs จาก DB → เพิ่มเป็น step, จัดลำดับ, ตั้ง depends_on, error strategy |
 | 2. Connections | ทดสอบ connection | เลือก shared source/target datasource, charset selector, "Test All" button |
 | 3. Review | ตรวจสอบ | สรุป table แสดง steps + dependencies, batch size/truncate/test mode, checkpoint resume panel |
-| 4. Execute | รัน pipeline | per-step status cards, "Refresh Status" button (poll DB), post-execution summary |
+| 4. Execute | รัน pipeline | per-step status cards, "Refresh Status" button (poll DB), post-execution summary, "Force Cancel" button สำหรับ zombie runs |
 
 **UI Polling** (Challenge 3): ใช้ "Refresh Status" button → `callbacks["on_poll_status"]()` → `st.rerun()` เพื่อไม่เพิ่ม dependency (ไม่ใช้ `streamlit-autorefresh`)
 
@@ -468,14 +480,28 @@ elif page == "🔗 Data Pipeline":
 
 ## Design Considerations
 
-### Thread Safety กับ SQLite
-Background thread เขียน `pipeline_runs` ขณะ Streamlit main thread อ่าน — SQLite รองรับ concurrent reads แต่ writer ทีละคน. Mitigation: ใช้ short transactions ใน `update_pipeline_run()` / `get_latest_pipeline_run()`. `get_connection()` เดิมสร้าง connection ใหม่ทุกครั้ง ซึ่ง safe สำหรับ cross-thread
+### Thread Safety กับ SQLite (`check_same_thread`)
+Background thread เขียน `pipeline_runs` ขณะ Streamlit main thread อ่าน — SQLite รองรับ concurrent reads แต่ writer ทีละคน.
+
+**Gotcha**: `sqlite3.connect()` default คือ `check_same_thread=True` → ถ้า background thread เรียก `get_connection()` จะได้ connection ใหม่ แต่ต้อง **ไม่โยน connection object ข้าม thread** ไม่งั้นจะเจอ `ProgrammingError: SQLite objects created in a thread can only be used in that same thread`
+
+**Solution**: CRUD functions ทุกตัวที่ background thread เรียก (`update_pipeline_run`, `save_pipeline_run`) ต้องเรียก `get_connection()` ภายในฟังก์ชันเอง (ไม่รับ connection เป็น parameter) — pattern เดิมของ `database.py` ทำแบบนี้อยู่แล้ว ให้รักษา pattern นี้ไว้
 
 ### Engine Disposal
 `run_single_migration()` ต้อง dispose engines ใน `finally` block **เสมอ** แม้เกิด exception กลาง batch. PipelineExecutor ต้องไม่ share engines ข้าม steps (ตาม JIT pattern)
 
-### HN Counter State
-`DataTransformer.reset_hn_counter()` ใช้ class-level variable. แต่ละ step ที่มี `GENERATE_HN` จะ init counter ใหม่ผ่าน `_init_hn_counter()` ใน `run_single_migration()` — ไม่ conflict ข้าม steps
+### HN Counter State (Race Condition ถ้ารัน 2 Pipelines พร้อมกัน)
+`DataTransformer.reset_hn_counter()` ใช้ class-level variable (`_hn_counter`). แต่ละ step ที่มี `GENERATE_HN` จะ init counter ใหม่ผ่าน `_init_hn_counter()` ใน `run_single_migration()` — ไม่ conflict ข้าม steps **ตราบใดที่รันแค่ 1 pipeline ในเวลาเดียวกัน**
+
+**Gotcha**: ถ้าในอนาคตรองรับ concurrent pipelines → class-level variable จะถูกเขียนทับ (race condition). ตอนนี้ไม่ได้ออกแบบให้รันพร้อมกัน แต่ควรเพิ่ม guard ใน `_on_start_pipeline()` เช็คว่ามี run ที่ `status='running'` อยู่หรือไม่ → ถ้ามีให้ block ไม่ให้เริ่ม pipeline ใหม่
+
+### Zombie Runs — Daemon Thread + Server Restart
+เนื่องจากใช้ `threading.Thread(daemon=True)` หาก Streamlit App ถูก restart (server reboot, deploy ใหม่) ระหว่าง pipeline รันอยู่ → daemon thread ตายพร้อม main process ทันที → `pipeline_runs` ค้างสถานะ `running` ตลอดกาล (zombie run)
+
+**Solution (Phase 5B)**:
+1. **Stale run detection**: ตอน controller `run()` ถูกเรียก → เช็ค `pipeline_runs` ที่ `status='running'` แต่ `started_at` เก่ากว่า threshold (เช่น 24 ชม.) → แสดง warning ใน UI
+2. **"Force Mark Failed" button**: ใน Execute step (Step 4) แสดงปุ่มสำหรับ run ที่ค้างนานผิดปกติ → เรียก `update_pipeline_run(run_id, "failed", error_message="Manually cancelled — suspected zombie run")`
+3. **Startup cleanup** (optional future): ใน `pipeline_controller.run()` เพิ่ม logic ตรวจ zombie runs อัตโนมัติตอนเปิดหน้า
 
 ---
 
