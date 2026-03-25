@@ -2,12 +2,60 @@
 Shared Dialogs — reusable @st.dialog components used across multiple pages.
 
 Components:
+    generic_confirm_dialog(title, message, confirm_label, on_confirm_func, ...)
+    preview_config_dialog(config_name, content)
     show_json_preview(json_data)
     show_diff_dialog(config_name, version1, version2, diff_data)
 """
 import json
 import streamlit as st
 import database as db
+
+
+@st.dialog("Please Confirm")
+def generic_confirm_dialog(
+    title: str,
+    message: str,
+    confirm_label: str,
+    on_confirm_func,
+    *args,
+    **kwargs,
+) -> None:
+    """
+    Reusable confirmation dialog with a red primary confirm button.
+
+    The on_confirm_func is responsible for any st.rerun() after the action.
+    Designed to be used by controllers that pass action callbacks.
+    """
+    st.markdown(f"### {title}")
+    st.write(message)
+    st.write("")  # spacer
+
+    c_spacer, c_cancel, c_confirm = st.columns([2, 1, 2.5])
+    with c_cancel:
+        if st.button("Cancel", type="secondary", use_container_width=True):
+            st.rerun()
+    with c_confirm:
+        if st.button(confirm_label, type="primary", use_container_width=True):
+            try:
+                on_confirm_func(*args, **kwargs)
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+
+@st.dialog("Preview Configuration")
+def preview_config_dialog(config_name: str, content: dict | None) -> None:
+    """
+    Renders a pre-fetched config as formatted JSON.
+
+    The controller must fetch content via db.get_config_content() before
+    calling this dialog — the view must never fetch data itself.
+    """
+    if content:
+        st.markdown(f"### 📄 Config: `{config_name}`")
+        st.json(content, expanded=True)
+    else:
+        st.error("Could not load configuration content.")
 
 
 @st.dialog("Preview Configuration JSON")
