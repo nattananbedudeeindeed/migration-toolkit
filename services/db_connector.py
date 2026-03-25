@@ -22,7 +22,7 @@ def _safe_id(name: str) -> str:
 #  Used for Migration Engine (Pandas read_sql/to_sql)
 # ==========================================
 
-def create_sqlalchemy_engine(db_type, host, port, db_name, user, password, charset=None) -> Optional[Engine]:
+def create_sqlalchemy_engine(db_type, host, port, db_name, user, password, charset=None, **engine_kwargs) -> Optional[Engine]:
     """
     Creates a SQLAlchemy Engine using URL object construction.
     This prevents errors when passwords contain special characters (@, :, /).
@@ -82,7 +82,7 @@ def create_sqlalchemy_engine(db_type, host, port, db_name, user, password, chars
             raise ValueError(f"Unsupported DB Type for Engine: {db_type}")
 
         # Create Engine with pool settings
-        engine = create_engine(connection_url)
+        engine = create_engine(connection_url, **engine_kwargs)
         return engine
 
     except Exception as e:

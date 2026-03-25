@@ -125,11 +125,23 @@ def _render_save_button(active_table, datasource_names, loaded_config, is_edit_e
 
 def generate_json_config(params: dict, mappings_df: pd.DataFrame) -> dict:
     """Build the config JSON dict from params + mapping DataFrame."""
+    source_obj: dict = {"database": params["source_db"], "table": params["table_name"]}
+    if params.get("source_datasource_id") is not None:
+        source_obj["datasource_id"] = params["source_datasource_id"]
+    if params.get("source_datasource_name"):
+        source_obj["datasource_name"] = params["source_datasource_name"]
+
+    target_obj: dict = {"database": params["target_db"], "table": params["target_table"]}
+    if params.get("target_datasource_id") is not None:
+        target_obj["datasource_id"] = params["target_datasource_id"]
+    if params.get("target_datasource_name"):
+        target_obj["datasource_name"] = params["target_datasource_name"]
+
     config_data = {
         "name": params["config_name"],
         "module": params["module"],
-        "source": {"database": params["source_db"], "table": params["table_name"]},
-        "target": {"database": params["target_db"], "table": params["target_table"]},
+        "source": source_obj,
+        "target": target_obj,
         "mappings": [],
     }
 
@@ -236,6 +248,9 @@ def _build_params(
     tgt_db_actual = _resolve_dbname(tgt_db_display, datasource_names)
     tgt_tbl_actual = st.session_state.get("mapper_tgt_tbl", target_table_input or "")
 
+    src_ds = DSRepo.get_by_name(src_db_display) if src_db_display and src_db_display in datasource_names else None
+    tgt_ds = DSRepo.get_by_name(tgt_db_display) if tgt_db_display and tgt_db_display in datasource_names else None
+
     return {
         "config_name": config_name,
         "table_name": active_table,
@@ -244,6 +259,10 @@ def _build_params(
         "target_db": tgt_db_actual,
         "target_table": tgt_tbl_actual,
         "dependencies": [],
+        "source_datasource_id": src_ds.get("id") if src_ds else None,
+        "source_datasource_name": src_db_display if src_ds else "",
+        "target_datasource_id": tgt_ds.get("id") if tgt_ds else None,
+        "target_datasource_name": tgt_db_display if tgt_ds else "",
     }
 
 
