@@ -6,7 +6,7 @@ import database as db
 from views import schema_mapper, migration_engine, file_explorer, er_diagram
 
 # Import Controllers (MVC-refactored pages)
-from controllers import settings_controller
+from controllers import settings_controller, pipeline_controller
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="HIS Migration Toolkit", layout="wide", page_icon="🏥")
@@ -22,12 +22,13 @@ st.title("🏥 HIS Migration Toolkit Center")
 with st.sidebar:
     st.header("Navigate")
     page = st.radio(
-        "Go to", 
+        "Go to",
         [
-            "📊 Schema Mapper", 
-            "🚀 Migration Engine", 
+            "📊 Schema Mapper",
+            "🚀 Migration Engine",
+            "🔗 Data Pipeline",
             "🗺️ ER Diagram",
-            "📁 File Explorer", 
+            "📁 File Explorer",
             "⚙️ Datasource & Config"
         ]
     )
@@ -42,6 +43,9 @@ if page == "📊 Schema Mapper":
 elif page == "🚀 Migration Engine":
     migration_engine.render_migration_engine_page()
     
+elif page == "🔗 Data Pipeline":
+    pipeline_controller.run()
+
 elif page == "🗺️ ER Diagram":
     er_diagram.render_er_diagram_page()
     

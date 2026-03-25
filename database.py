@@ -72,6 +72,30 @@ def init_db():
                   json_data TEXT,
                   created_at TIMESTAMP,
                   FOREIGN KEY(config_id) REFERENCES configs(id) ON DELETE CASCADE)''')
+
+    # Table: Pipelines
+    c.execute('''CREATE TABLE IF NOT EXISTS pipelines
+                 (id TEXT PRIMARY KEY,
+                  name TEXT UNIQUE NOT NULL,
+                  description TEXT DEFAULT '',
+                  json_data TEXT,
+                  source_datasource_id INTEGER,
+                  target_datasource_id INTEGER,
+                  error_strategy TEXT DEFAULT 'fail_fast',
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+    # Table: Pipeline Runs — written by background thread, polled by UI
+    c.execute('''CREATE TABLE IF NOT EXISTS pipeline_runs
+                 (id TEXT PRIMARY KEY,
+                  pipeline_id TEXT NOT NULL,
+                  status TEXT DEFAULT 'pending',
+                  started_at TIMESTAMP,
+                  completed_at TIMESTAMP,
+                  steps_json TEXT,
+                  error_message TEXT,
+                  FOREIGN KEY(pipeline_id) REFERENCES pipelines(id) ON DELETE CASCADE)''')
+
     conn.commit()
     conn.close()
 
@@ -306,6 +330,202 @@ def get_config_version(config_name, version):
         return None
     finally:
         conn.close()
+
+# --- Pipeline CRUD Operations ---
+
+def save_pipeline(name, description, json_data, source_ds_id, target_ds_id, error_strategy):
+    """Save (insert or overwrite) a pipeline. Preserves id on update."""
+    conn = get_connection()
+    c = conn.cursor()
+    try:
+        json_str = json.dumps(json_data) if isinstance(json_data, dict) else json_data
+
+        # Reuse existing id so foreign keys in pipeline_runs stay intact
+        c.execute("SELECT id FROM pipelines WHERE name=?", (name,))
+        existing = c.fetchone()
+        if existing:
+            pipeline_id = existing[0]
+        else:
+            # Prefer the id embedded in json_data (from PipelineConfig.to_dict)
+            pipeline_id = (json_data.get("id") if isinstance(json_data, dict) else None) or str(uuid.uuid4())
+
+        c.execute(
+            '''INSERT OR REPLACE INTO pipelines
+               (id, name, description, json_data, source_datasource_id,
+                target_datasource_id, error_strategy, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            (pipeline_id, name, description, json_str,
+             source_ds_id, target_ds_id, error_strategy, datetime.now()),
+        )
+        conn.commit()
+        return True, "Pipeline saved!"
+    except sqlite3.IntegrityError:
+        return False, f"Pipeline name '{name}' already exists."
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def get_pipelines_list():
+    """Return a lightweight DataFrame for the pipeline list UI."""
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(
+            '''SELECT id, name, description, error_strategy,
+                      source_datasource_id, target_datasource_id,
+                      created_at, updated_at
+               FROM pipelines ORDER BY updated_at DESC''',
+            conn,
+        )
+    except Exception:
+        df = pd.DataFrame(columns=[
+            "id", "name", "description", "error_strategy",
+            "source_datasource_id", "target_datasource_id",
+            "created_at", "updated_at",
+        ])
+    finally:
+        conn.close()
+    return df
+
+
+def get_pipeline_by_name(name):
+    """Return full pipeline record including parsed json_data, or None."""
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(
+        '''SELECT id, name, description, json_data, source_datasource_id,
+                  target_datasource_id, error_strategy, created_at, updated_at
+           FROM pipelines WHERE name=?''',
+        (name,),
+    )
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0],
+            "name": row[1],
+            "description": row[2],
+            "json_data": json.loads(row[3]) if row[3] else {},
+            "source_datasource_id": row[4],
+            "target_datasource_id": row[5],
+            "error_strategy": row[6],
+            "created_at": row[7],
+            "updated_at": row[8],
+        }
+    return None
+
+
+def delete_pipeline(name):
+    """Delete a pipeline and its runs (CASCADE)."""
+    conn = get_connection()
+    c = conn.cursor()
+    try:
+        c.execute("DELETE FROM pipelines WHERE name=?", (name,))
+        conn.commit()
+        return True, "Pipeline deleted successfully"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+# --- Pipeline Runs CRUD ---
+# All functions open their own connection so they are safe to call from a
+# background thread (SQLite objects must not cross thread boundaries).
+
+def save_pipeline_run(pipeline_id, status, steps_json):
+    """Insert a new run record. Returns the new run_id (UUID string)."""
+    conn = get_connection()
+    c = conn.cursor()
+    run_id = str(uuid.uuid4())
+    try:
+        c.execute(
+            '''INSERT INTO pipeline_runs
+               (id, pipeline_id, status, started_at, steps_json)
+               VALUES (?, ?, ?, ?, ?)''',
+            (run_id, pipeline_id, status, datetime.now(), steps_json),
+        )
+        conn.commit()
+        return run_id
+    except Exception as e:
+        print(f"save_pipeline_run error: {e}")
+        return run_id
+    finally:
+        conn.close()
+
+
+def update_pipeline_run(run_id, status, steps_json, error_message=None):
+    """Update an existing run's status and step snapshot.
+
+    Sets completed_at for any terminal status (not 'running'/'pending').
+    Safe to call from a background thread — opens its own connection.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+    terminal = status not in ("running", "pending")
+    try:
+        c.execute(
+            '''UPDATE pipeline_runs
+               SET status=?, steps_json=?, error_message=?,
+                   completed_at=CASE WHEN ? THEN ? ELSE completed_at END
+               WHERE id=?''',
+            (status, steps_json, error_message,
+             terminal, datetime.now().isoformat(),
+             run_id),
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"update_pipeline_run error: {e}")
+    finally:
+        conn.close()
+
+
+def get_pipeline_runs(pipeline_id):
+    """Return all runs for a pipeline as a DataFrame, newest first."""
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(
+            '''SELECT id, status, started_at, completed_at, error_message
+               FROM pipeline_runs WHERE pipeline_id=?
+               ORDER BY started_at DESC''',
+            conn,
+            params=(pipeline_id,),
+        )
+    except Exception:
+        df = pd.DataFrame(columns=["id", "status", "started_at", "completed_at", "error_message"])
+    finally:
+        conn.close()
+    return df
+
+
+def get_latest_pipeline_run(pipeline_id):
+    """Return the most recent run record for a pipeline, or None.
+
+    Used by the UI to poll background thread progress.
+    steps_json is parsed back to a dict for convenience.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(
+        '''SELECT id, status, started_at, completed_at, steps_json, error_message
+           FROM pipeline_runs WHERE pipeline_id=?
+           ORDER BY started_at DESC LIMIT 1''',
+        (pipeline_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0],
+            "status": row[1],
+            "started_at": row[2],
+            "completed_at": row[3],
+            "steps": json.loads(row[4]) if row[4] else {},
+            "error_message": row[5],
+        }
+    return None
+
 
 def compare_config_versions(config_name, version1, version2):
     """Compares two versions of a configuration and returns the differences."""
